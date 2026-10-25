@@ -683,6 +683,103 @@ pub async fn validate_admin_event(
     }
 }
 
+// Suppress only ordinary deletion notices in operator-selected channels.
+// Preserve moderation tombstones: those can be the only live UI signal for
+// operator-initiated removals. The original signed 9005 deletion still flows.
+fn deletion_notice_policy_matches(
+    community_host: &str,
+    channel_id: Uuid,
+    content: &serde_json::Value,
+    enabled: bool,
+    allowed_host: &str,
+    allowed_channel_ids: &str,
+) -> bool {
+    if !enabled || community_host != allowed_host {
+        return false;
+    }
+    if content.get("type").and_then(serde_json::Value::as_str) != Some("message_deleted")
+        || content.get("action_id").is_some()
+        || content.get("reason_code").is_some()
+        || content.get("public_reason").is_some()
+    {
+        return false;
+    }
+    allowed_channel_ids
+        .split(',')
+        .filter_map(|id| Uuid::parse_str(id.trim()).ok())
+        .any(|allowed| allowed == channel_id)
+}
+
+fn should_suppress_deletion_notice(
+    tenant: &TenantContext,
+    channel_id: Uuid,
+    content: &serde_json::Value,
+) -> bool {
+    if content.get("type").and_then(serde_json::Value::as_str) != Some("message_deleted") {
+        return false;
+    }
+    let enabled = std::env::var("BUZZ_SUPPRESS_DELETION_NOTICES")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("true"));
+    let allowed_host = std::env::var("BUZZ_SUPPRESS_DELETION_NOTICE_HOST").unwrap_or_default();
+    let allowed_channels =
+        std::env::var("BUZZ_SUPPRESS_DELETION_NOTICE_CHANNEL_IDS").unwrap_or_default();
+    deletion_notice_policy_matches(
+        tenant.host(),
+        channel_id,
+        content,
+        enabled,
+        &allowed_host,
+        &allowed_channels,
+    )
+}
+
+#[cfg(test)]
+mod deletion_notice_suppression_tests {
+    use super::deletion_notice_policy_matches;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    const HOST: &str = "relay.example.invalid";
+    const SELECTED: &str = "11111111-1111-4111-8111-111111111111";
+    const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn only_selected_host_and_channel_are_suppressed_when_enabled() {
+        let channel_id = Uuid::parse_str(SELECTED).unwrap();
+        let payload = json!({"type": "message_deleted", "target_event_id": "abcd"});
+        assert!(deletion_notice_policy_matches(
+            HOST, channel_id, &payload, true, HOST, &format!("{OTHER}, {SELECTED}"),
+        ));
+        assert!(!deletion_notice_policy_matches(
+            HOST, channel_id, &payload, false, HOST, SELECTED,
+        ));
+        assert!(!deletion_notice_policy_matches(
+            HOST, channel_id, &payload, true, "another.example.invalid", SELECTED,
+        ));
+        assert!(!deletion_notice_policy_matches(
+            HOST, channel_id, &payload, true, HOST, OTHER,
+        ));
+        assert!(!deletion_notice_policy_matches(
+            HOST, channel_id, &payload, true, HOST, "not-a-uuid",
+        ));
+    }
+
+    #[test]
+    fn preserves_other_system_events_and_moderation_notices() {
+        let channel_id = Uuid::parse_str(SELECTED).unwrap();
+        for payload in [
+            json!({"type": "member_joined"}),
+            json!({"type": "message_deleted", "action_id": "admin-action"}),
+            json!({"type": "message_deleted", "public_reason": "moderator removal"}),
+            json!({"type": "message_deleted", "reason_code": "policy"}),
+        ] {
+            assert!(!deletion_notice_policy_matches(
+                HOST, channel_id, &payload, true, HOST, SELECTED,
+            ));
+        }
+    }
+}
+
 /// Emit a system message (kind 40099) signed by the relay keypair.
 ///
 /// `idempotency_ts` is used as the event's `created_at`. Passing a stable
@@ -699,6 +796,10 @@ pub async fn emit_system_message(
     content: serde_json::Value,
     idempotency_ts: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<()> {
+    if should_suppress_deletion_notice(tenant, channel_id, &content) {
+        info!(channel = %channel_id, "Suppressed plain deletion notice by operator policy");
+        return Ok(());
+    }
     let channel_tag = Tag::parse(["h", &channel_id.to_string()])?;
 
     let ts = nostr::Timestamp::from(idempotency_ts.timestamp() as u64);
