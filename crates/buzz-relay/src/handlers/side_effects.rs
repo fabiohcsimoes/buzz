@@ -956,6 +956,155 @@ pub async fn validate_admin_event(
     }
 }
 
+// Fail closed: only the exact plain-deletion payload is eligible.
+// Moderator-authored notices include additional fields (such as action_id or
+// public_reason), and must continue to be emitted.
+fn plain_deletion_notice_payload(content: &serde_json::Value) -> bool {
+    let Some(obj) = content.as_object() else {
+        return false;
+    };
+    obj.len() == 3
+        && obj.get("type").and_then(serde_json::Value::as_str) == Some("message_deleted")
+        && obj
+            .get("actor")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+        && obj
+            .get("target_event_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+}
+
+// All three operator settings are required. No default host or channel list:
+// a missing or misspelled configuration leaves the original behavior intact.
+fn deletion_notice_suppression_matches(
+    host: &str,
+    channel_id: Uuid,
+    content: &serde_json::Value,
+    enabled: bool,
+    target_host: &str,
+    allowlist: &str,
+) -> bool {
+    enabled
+        && !target_host.is_empty()
+        && host == target_host
+        && plain_deletion_notice_payload(content)
+        && allowlist
+            .split(',')
+            .filter_map(|v| Uuid::parse_str(v.trim()).ok())
+            .any(|candidate| candidate == channel_id)
+}
+
+fn should_suppress_plain_deletion_notice(
+    tenant: &TenantContext,
+    channel_id: Uuid,
+    content: &serde_json::Value,
+) -> bool {
+    if !plain_deletion_notice_payload(content) {
+        return false;
+    }
+    let enabled = std::env::var("BUZZ_SUPPRESS_DELETION_NOTICES")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
+    let target_host = std::env::var("BUZZ_SUPPRESS_DELETION_NOTICE_HOST").unwrap_or_default();
+    let allowlist = std::env::var("BUZZ_SUPPRESS_DELETION_NOTICE_CHANNEL_IDS").unwrap_or_default();
+    deletion_notice_suppression_matches(
+        tenant.host(),
+        channel_id,
+        content,
+        enabled,
+        &target_host,
+        &allowlist,
+    )
+}
+
+#[cfg(test)]
+mod deletion_notice_policy_tests {
+    use super::deletion_notice_suppression_matches;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    const HOST: &str = "relay.example.invalid";
+    const CHANNEL: &str = "11111111-1111-4111-8111-111111111111";
+    const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn plain() -> serde_json::Value {
+        json!({
+            "type": "message_deleted",
+            "actor": "signer",
+            "target_event_id": "target"
+        })
+    }
+
+    #[test]
+    fn scoped_and_disabled_by_default() {
+        let channel = Uuid::parse_str(CHANNEL).unwrap();
+        assert!(deletion_notice_suppression_matches(
+            HOST,
+            channel,
+            &plain(),
+            true,
+            HOST,
+            &format!("{OTHER}, {CHANNEL}")
+        ));
+        assert!(!deletion_notice_suppression_matches(
+            HOST,
+            channel,
+            &plain(),
+            false,
+            HOST,
+            CHANNEL
+        ));
+        assert!(!deletion_notice_suppression_matches(
+            HOST,
+            channel,
+            &plain(),
+            true,
+            "",
+            CHANNEL
+        ));
+        assert!(!deletion_notice_suppression_matches(
+            HOST,
+            channel,
+            &plain(),
+            true,
+            "other.example.invalid",
+            CHANNEL
+        ));
+        assert!(!deletion_notice_suppression_matches(
+            HOST,
+            channel,
+            &plain(),
+            true,
+            HOST,
+            OTHER
+        ));
+        assert!(!deletion_notice_suppression_matches(
+            HOST,
+            channel,
+            &plain(),
+            true,
+            HOST,
+            "not-a-uuid"
+        ));
+    }
+
+    #[test]
+    fn moderation_and_other_events_are_preserved() {
+        let channel = Uuid::parse_str(CHANNEL).unwrap();
+        for payload in [
+            json!({"type":"member_joined"}),
+            json!({"type":"message_deleted","actor":"a","target_event_id":"b","action_id":"c"}),
+            json!({"type":"message_deleted","actor":"a","target_event_id":"b","public_reason":"removed"}),
+            json!({"type":"message_deleted","actor":"a","target_event_id":"b","reason_code":"policy"}),
+            json!({"type":"message_deleted","actor":"a"}),
+        ] {
+            assert!(!deletion_notice_suppression_matches(
+                HOST, channel, &payload, true, HOST, CHANNEL
+            ));
+        }
+    }
+}
+
 /// Emit a system message (kind 40099) signed by the relay keypair.
 ///
 /// `idempotency_ts` is used as the event's `created_at`. Passing a stable
@@ -972,6 +1121,11 @@ pub async fn emit_system_message(
     content: serde_json::Value,
     idempotency_ts: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<()> {
+    if should_suppress_plain_deletion_notice(tenant, channel_id, &content) {
+        info!(channel = %channel_id, "Suppressed plain deletion notice by HIVE opt-in policy");
+        return Ok(());
+    }
+
     let event = sign_system_message(state, channel_id, content, idempotency_ts)?;
 
     // Durable insert is the completion boundary — propagate failure.
