@@ -965,7 +965,10 @@ fn plain_deletion_notice_payload(content: &serde_json::Value) -> bool {
     };
     obj.len() == 3
         && obj.get("type").and_then(serde_json::Value::as_str) == Some("message_deleted")
-        && obj.get("actor").and_then(serde_json::Value::as_str).is_some_and(|v| !v.is_empty())
+        && obj
+            .get("actor")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| !v.is_empty())
         && obj
             .get("target_event_id")
             .and_then(serde_json::Value::as_str)
@@ -1036,22 +1039,52 @@ mod deletion_notice_policy_tests {
     fn scoped_and_disabled_by_default() {
         let channel = Uuid::parse_str(CHANNEL).unwrap();
         assert!(deletion_notice_suppression_matches(
-            HOST, channel, &plain(), true, HOST, &format!("{OTHER}, {CHANNEL}")
+            HOST,
+            channel,
+            &plain(),
+            true,
+            HOST,
+            &format!("{OTHER}, {CHANNEL}")
         ));
         assert!(!deletion_notice_suppression_matches(
-            HOST, channel, &plain(), false, HOST, CHANNEL
+            HOST,
+            channel,
+            &plain(),
+            false,
+            HOST,
+            CHANNEL
         ));
         assert!(!deletion_notice_suppression_matches(
-            HOST, channel, &plain(), true, "", CHANNEL
+            HOST,
+            channel,
+            &plain(),
+            true,
+            "",
+            CHANNEL
         ));
         assert!(!deletion_notice_suppression_matches(
-            HOST, channel, &plain(), true, "other.example.invalid", CHANNEL
+            HOST,
+            channel,
+            &plain(),
+            true,
+            "other.example.invalid",
+            CHANNEL
         ));
         assert!(!deletion_notice_suppression_matches(
-            HOST, channel, &plain(), true, HOST, OTHER
+            HOST,
+            channel,
+            &plain(),
+            true,
+            HOST,
+            OTHER
         ));
         assert!(!deletion_notice_suppression_matches(
-            HOST, channel, &plain(), true, HOST, "not-a-uuid"
+            HOST,
+            channel,
+            &plain(),
+            true,
+            HOST,
+            "not-a-uuid"
         ));
     }
 
